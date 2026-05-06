@@ -4,9 +4,11 @@
  *
  * Features: text + voice + photos + documents + media groups → Claude Code → response
  *           sessions, DNA files, persistent keyboard, folder structure awareness
+ *           stream mode, crash recovery, circuit breaker, confirmation buttons,
+ *           thinking phrases rotation, URL pre-fetch, human-friendly errors
  */
 
-import { Bot, Keyboard, InputFile } from "grammy";
+import { Bot, Keyboard, InlineKeyboard, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync } from "node:fs";
@@ -14,6 +16,7 @@ import { readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
+import { execSync } from "node:child_process";
 import https from "node:https";
 import http from "node:http";
 
@@ -28,6 +31,10 @@ const MEDIA_DIR = join(WORKSPACE, ".media");
 const SESSIONS_FILE = join(DATA_DIR, "sessions.json");
 const OWNER_FILE = join(DATA_DIR, "owner.json");
 const SYSTEM_PROMPT_PATH = join(WORKSPACE, "CLAUDE.md");
+const CRASH_CONTEXT_FILE = join(DATA_DIR, ".crash_context.md");
+const MAX_SESSION_SIZE = 2 * 1024 * 1024; // 2 MB — start fresh if session too large
+const MAX_SYSTEM_PROMPT_CHARS = 30000;
+const STREAM_THROTTLE_MS = 1500;
 
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is required");
@@ -100,7 +107,20 @@ function saveSessions() {
 
 const sessions = loadSessions();
 
-// ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
+// ─── CIRCUIT BREAKER (rate limiting protection) ─────────────────────────────
+
+let _rateLimitUntil = 0;
+
+function setGlobalRateLimit(retryAfterSec) {
+  _rateLimitUntil = Date.now() + (retryAfterSec || 5) * 1000;
+  console.warn(`[rate-limit] breaker ON for ${retryAfterSec}s`);
+}
+
+function isGloballyRateLimited() {
+  return Date.now() < _rateLimitUntil;
+}
+
+// ─── SYSTEM PROMPT (with mtime caching) ─────────────────────────────────────
 
 const ARCHITECTURE_CONTEXT = `
 ## Архитектура файловой системы агента
@@ -116,10 +136,12 @@ const ARCHITECTURE_CONTEXT = `
 |   |-- SOUL.md                 <- твоя личность
 |   |-- MEMORY.md               <- долгосрочная память (обновляй!)
 |   |-- GOALS.md                <- цели пользователя
+|   |-- USER.md, MISSION.md, PROJECTS.md, PREFERENCES.md, LEARNED.md
 |   |-- .media/                 <- медиафайлы от пользователя (фото, документы)
 |   |-- memory/                 <- дневники по дням (YYYY-MM-DD.md)
 |   +-- knowledge/              <- база знаний (справочники, инструкции)
-|-- projects/                   <- папка для ПРОЕКТОВ
+|-- projects/                   <- папка для ПРОЕКТОВ (каждый проект в подпапке)
+|   +-- название-проекта/       <- сюда создавай новые проекты
 +-- .agent/                     <- служебная папка бота (не трогай)
 
 ВАЖНО:
@@ -128,10 +150,14 @@ const ARCHITECTURE_CONTEXT = `
 - Скиллы лежат в /home/agent/.claude/skills/ — если пользователь просит установить скилл, клади туда
 - Настройки Claude Code (settings.json) — в /home/agent/.claude/
 - Медиафайлы от пользователя сохраняются в workspace/.media/ — используй Read для их чтения
+- При создании проекта: mkdir -p ~/projects/название && cd ~/projects/название
 `;
 
 const MAX_MEMORY_CHARS = 15000;
 const MAX_DIARY_CHARS = 2000;
+
+// Cache for system prompt file
+let _sysPromptCache = { mtime: 0, content: "" };
 
 function _safeRead(path) {
   try {
@@ -140,20 +166,31 @@ function _safeRead(path) {
   } catch { return ""; }
 }
 
+function _cachedRead(path) {
+  try {
+    const stat = statSync(path);
+    const mtime = stat.mtimeMs;
+    if (mtime === _sysPromptCache.mtime) return _sysPromptCache.content;
+    const content = readFileSync(path, "utf8");
+    _sysPromptCache = { mtime, content };
+    return content;
+  } catch { return ""; }
+}
+
 function buildSystemPrompt() {
   const parts = [];
 
-  // 1. CLAUDE-SYSTEM.md — main rules (media tags, formatting, etc.)
-  const sysRules = _safeRead(SYSTEM_PROMPT_PATH);
+  // 1. CLAUDE.md — main rules (cached by mtime)
+  const sysRules = _cachedRead(SYSTEM_PROMPT_PATH);
   if (sysRules) parts.push(sysRules);
 
   // 2. Architecture context
   parts.push(ARCHITECTURE_CONTEXT);
 
-  // 3. All 8 DNA files
+  // 3. All DNA files (skip CLAUDE.md — already loaded)
   const dnaFiles = [
     "SOUL.md", "USER.md", "MEMORY.md", "MISSION.md",
-    "GOALS.md", "PROJECTS.md", "PREFERENCES.md", "LEARNED.md", "CLAUDE.md",
+    "GOALS.md", "PROJECTS.md", "PREFERENCES.md", "LEARNED.md",
   ];
   for (const name of dnaFiles) {
     const text = _safeRead(join(WORKSPACE, name));
@@ -165,7 +202,7 @@ function buildSystemPrompt() {
     }
   }
 
-  // 4. Today's diary
+  // 4. Today's diary (last N chars — newest data)
   const today = new Date().toISOString().split("T")[0];
   const todayText = _safeRead(join(WORKSPACE, "memory", `${today}.md`));
   if (todayText) {
@@ -183,11 +220,105 @@ function buildSystemPrompt() {
     parts.push(`--- Дневник ${yStr} ---\n${d}`);
   }
 
-  // 6. Current date + memory nudge
+  // 6. Crash context (if previous session crashed)
+  if (existsSync(CRASH_CONTEXT_FILE)) {
+    try {
+      const ctx = readFileSync(CRASH_CONTEXT_FILE, "utf8");
+      parts.push(`--- Контекст: предыдущая сессия завершилась ошибкой ---\n${ctx}`);
+      unlinkSync(CRASH_CONTEXT_FILE);
+      console.log("[crash-recovery] injected crash context");
+    } catch {}
+  }
+
+  // 7. Current date + memory nudge
   parts.push(`# Current date\n${today}`);
   parts.push("# Memory reminder\nЕсли в этом диалоге появились важные факты, решения или предпочтения клиента — сохрани их в memory/YYYY-MM-DD.md или MEMORY.md. Не теряй контекст между сессиями.");
 
-  return parts.join("\n\n");
+  // Trim to max
+  let result = parts.join("\n\n");
+  if (result.length > MAX_SYSTEM_PROMPT_CHARS) {
+    result = result.slice(0, MAX_SYSTEM_PROMPT_CHARS);
+  }
+  return result;
+}
+
+// ─── THINKING PHRASES ───────────────────────────────────────────────────────
+
+const THINKING_PHRASES = [
+  ["Думаю...", "⏳"],
+  ["Соображаю...", "🤔"],
+  ["Мозгую...", "🧠"],
+  ["Анализирую...", "🔍"],
+  ["Копаюсь в памяти...", "📚"],
+  ["Обрабатываю...", "⚙️"],
+  ["Почти готов...", "✍️"],
+];
+
+let _phraseIdx = 0;
+function nextThinkingPhrase() {
+  const [text, emoji] = THINKING_PHRASES[_phraseIdx % THINKING_PHRASES.length];
+  _phraseIdx++;
+  return `${text} ${emoji}`;
+}
+
+// ─── HUMAN-FRIENDLY ERRORS ──────────────────────────────────────────────────
+
+function humanizeError(errMsg) {
+  const msg = String(errMsg);
+  if (msg.includes("429") || msg.includes("rate")) return "Слишком много запросов. Подожди минутку и попробуй снова.";
+  if (msg.includes("529") || msg.includes("503") || msg.includes("overloaded")) return "Серверы Claude перегружены. Попробуй через пару минут.";
+  if (msg.includes("401") || msg.includes("auth")) return "Проблема с авторизацией Claude. Нужно заново авторизоваться (claude auth login).";
+  if (msg.includes("image") || msg.includes("Could not process")) return "Не получилось обработать файл. Попробуй отправить в другом формате.";
+  if (msg.includes("timeout") || msg.includes("TIMEOUT")) return "Claude думал слишком долго. Попробуй задать вопрос короче.";
+  if (msg.includes("session") || msg.includes("corrupt")) return "Сессия повреждена. Нажми 🔄 Новый диалог.";
+  return null; // unknown error — show generic message
+}
+
+// ─── URL PRE-FETCH ──────────────────────────────────────────────────────────
+
+function extractUrls(text) {
+  const urlRe = /https?:\/\/[^\s<>"')\]]+/gi;
+  return (text.match(urlRe) || []).slice(0, 3); // max 3 URLs
+}
+
+async function prefetchUrl(url) {
+  return new Promise((resolve) => {
+    const proto = url.startsWith("https") ? https : http;
+    const req = proto.get(url, { timeout: 5000, headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
+      if (res.statusCode !== 200) return resolve(null);
+      let data = "";
+      res.on("data", (d) => {
+        data += d;
+        if (data.length > 10000) { res.destroy(); resolve(data.slice(0, 10000)); }
+      });
+      res.on("end", () => resolve(data.slice(0, 10000)));
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+  });
+}
+
+async function prefetchUrls(text) {
+  const urls = extractUrls(text);
+  if (urls.length === 0) return "";
+  const results = await Promise.allSettled(urls.map(prefetchUrl));
+  const parts = [];
+  for (let i = 0; i < urls.length; i++) {
+    const val = results[i].status === "fulfilled" ? results[i].value : null;
+    if (val) {
+      // Strip HTML tags for cleaner context
+      const clean = val.replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 3000);
+      if (clean.length > 100) {
+        parts.push(`[Контент с ${urls[i]}]:\n${clean}`);
+      }
+    }
+  }
+  return parts.length > 0 ? "\n\n" + parts.join("\n\n") : "";
 }
 
 // ─── CLAUDE CODE CLI ─────────────────────────────────────────────────────────
@@ -195,17 +326,35 @@ function buildSystemPrompt() {
 // Sequential queue — only one Claude call at a time
 let _queue = Promise.resolve();
 
-function callClaude(prompt, sessionId) {
-  const p = _queue.then(() => _callClaudeInner(prompt, sessionId));
+function callClaude(prompt, sessionId, { onText } = {}) {
+  const p = _queue.then(() => _callClaudeInner(prompt, sessionId, { onText }));
   _queue = p.catch(() => {});
   return p;
 }
 
-function _callClaudeInner(prompt, sessionId) {
+function _getSessionSize(sessionId) {
+  if (!sessionId) return 0;
+  try {
+    // Claude stores sessions in ~/.claude/sessions/
+    const sessDir = join(AGENT_HOME, ".claude", "sessions");
+    const sessFile = join(sessDir, sessionId + ".jsonl");
+    if (existsSync(sessFile)) return statSync(sessFile).size;
+  } catch {}
+  return 0;
+}
+
+function _callClaudeInner(prompt, sessionId, { onText } = {}) {
   return new Promise((resolve, reject) => {
+    // Check session size — if too large, start fresh
+    if (sessionId && _getSessionSize(sessionId) > MAX_SESSION_SIZE) {
+      console.log(`[session] ${sessionId} too large (>${MAX_SESSION_SIZE}), starting fresh`);
+      sessionId = null;
+    }
+
+    const useStream = typeof onText === "function";
     const args = [
       "-p", prompt,
-      "--output-format", "json",
+      "--output-format", useStream ? "stream-json" : "json",
       "--max-turns", "15",
       "--model", "sonnet",
       "--dangerously-skip-permissions",
@@ -225,11 +374,73 @@ function _callClaudeInner(prompt, sessionId) {
 
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
+    let lastText = "";
+    let lastStreamTs = 0;
+    let resultSessionId = sessionId;
+    let cost = 0;
+
+    child.stdout.on("data", (d) => {
+      stdout += d;
+
+      if (useStream) {
+        // Parse JSONL lines for streaming
+        const lines = stdout.split("\n");
+        stdout = lines.pop(); // keep incomplete line
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.type === "assistant" && obj.message?.content) {
+              for (const block of obj.message.content) {
+                if (block.type === "text" && block.text) {
+                  lastText = block.text;
+                  const now = Date.now();
+                  if (now - lastStreamTs >= STREAM_THROTTLE_MS) {
+                    lastStreamTs = now;
+                    onText(lastText);
+                  }
+                }
+              }
+            } else if (obj.type === "result") {
+              resultSessionId = obj.session_id || sessionId;
+              cost = obj.cost_usd || 0;
+              if (obj.result) lastText = obj.result;
+            }
+          } catch {}
+        }
+      }
+    });
+
     child.stderr.on("data", (d) => (stderr += d));
 
     child.on("close", (code) => {
+      if (useStream) {
+        // Parse any remaining line
+        if (stdout.trim()) {
+          try {
+            const obj = JSON.parse(stdout);
+            if (obj.type === "result") {
+              resultSessionId = obj.session_id || sessionId;
+              cost = obj.cost_usd || 0;
+              if (obj.result) lastText = obj.result;
+            }
+          } catch {}
+        }
+        resolve({
+          text: lastText || "(пустой ответ)",
+          sessionId: resultSessionId,
+          cost,
+        });
+        return;
+      }
+
+      // Non-stream JSON mode
       if (code !== 0 && !stdout.trim()) {
+        // Save crash context for recovery
+        try {
+          writeFileSync(CRASH_CONTEXT_FILE,
+            `Последний запрос (${new Date().toISOString()}):\n${prompt.slice(0, 500)}\n\nОшибка: exit ${code}\n${stderr.slice(0, 300)}`);
+        } catch {}
         return reject(new Error(`Claude exit ${code}: ${stderr.slice(0, 300)}`));
       }
       try {
@@ -245,7 +456,14 @@ function _callClaudeInner(prompt, sessionId) {
       }
     });
 
-    child.on("error", reject);
+    child.on("error", (err) => {
+      // Save crash context
+      try {
+        writeFileSync(CRASH_CONTEXT_FILE,
+          `Последний запрос (${new Date().toISOString()}):\n${prompt.slice(0, 500)}\n\nОшибка: ${err.message}`);
+      } catch {}
+      reject(err);
+    });
   });
 }
 
@@ -366,11 +584,13 @@ async function processMediaBatch(key) {
   const prompt = `${mediaIntro}\n${filesBlock}${caption ? `\n\nПодпись пользователя: ${caption}` : ""}`;
 
   try {
-    await ctx.api.editMessageText(chatId, statusMsgId, "Думаю... ⏳");
+    await ctx.api.editMessageText(chatId, statusMsgId, nextThinkingPhrase());
   } catch {}
 
   const typingInterval = setInterval(() => {
-    ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+    if (!isGloballyRateLimited()) {
+      ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+    }
   }, 4000);
 
   try {
@@ -389,16 +609,33 @@ async function processMediaBatch(key) {
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(chatId, statusMsgId).catch(() => {});
     console.error("[media-error]", err.message);
-    await ctx.reply("Ошибка обработки медиа. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
+    const friendly = humanizeError(err.message);
+    await ctx.reply(friendly || "Ошибка обработки медиа. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
   }
 }
 
 // ─── VOICE HANDLING ──────────────────────────────────────────────────────────
 
 async function transcribeVoice(filePath) {
+  // 1. Try Deepgram
   const apiKey = process.env.DEEPGRAM_API_KEY;
-  if (!apiKey) return null;
+  if (apiKey) {
+    try {
+      return await _deepgramTranscribe(filePath, apiKey);
+    } catch (e) {
+      console.warn("[voice] Deepgram failed:", e.message);
+    }
+  }
 
+  // 2. Fallback: local Whisper
+  try {
+    return _whisperTranscribe(filePath);
+  } catch {
+    return null;
+  }
+}
+
+function _deepgramTranscribe(filePath, apiKey) {
   return new Promise((resolve, reject) => {
     const fileData = readFileSync(filePath);
     const options = {
@@ -428,6 +665,32 @@ async function transcribeVoice(filePath) {
     req.write(fileData);
     req.end();
   });
+}
+
+function _whisperTranscribe(filePath) {
+  try {
+    execSync("which whisper", { stdio: "ignore" });
+  } catch {
+    return null; // whisper not installed
+  }
+  try {
+    const outDir = "/tmp";
+    execSync(`whisper "${filePath}" --model base --language ru --output_format txt --output_dir ${outDir}`, {
+      timeout: 60000,
+      stdio: "ignore",
+    });
+    const txtFile = filePath.replace(/\.\w+$/, ".txt");
+    const altTxtFile = join(outDir, basename(filePath).replace(/\.\w+$/, ".txt"));
+    const resultFile = existsSync(txtFile) ? txtFile : existsSync(altTxtFile) ? altTxtFile : null;
+    if (resultFile) {
+      const text = readFileSync(resultFile, "utf8").trim();
+      try { unlinkSync(resultFile); } catch {}
+      return text;
+    }
+  } catch (e) {
+    console.warn("[voice] Whisper failed:", e.message);
+  }
+  return null;
 }
 
 // ─── MARKDOWN → TELEGRAM HTML ────────────────────────────────────────────────
@@ -540,10 +803,23 @@ async function sendMediaItem(ctx, item) {
   }
 }
 
+// ─── CONFIRMATION BUTTONS ───────────────────────────────────────────────────
+
+function needsConfirmation(text) {
+  const lower = text.toLowerCase();
+  return /делаем\s*\?|план:|✔\s*(или|\/)\s*✖/i.test(lower);
+}
+
+function confirmKeyboard() {
+  return new InlineKeyboard()
+    .text("✔ Продолжай", "confirm_yes")
+    .text("✖ Стоп", "confirm_no");
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function getStatusText() {
-  const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md"];
+  const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md", "USER.md", "MISSION.md", "PROJECTS.md", "PREFERENCES.md"];
   const found = dnaFiles.filter((f) => existsSync(join(WORKSPACE, f)));
   const missing = dnaFiles.filter((f) => !existsSync(join(WORKSPACE, f)));
 
@@ -561,15 +837,25 @@ function getStatusText() {
     mediaCount = readdirSync(MEDIA_DIR).length;
   } catch {}
 
+  // Count skills
+  let skillCount = 0;
+  try {
+    const skillDir = join(AGENT_HOME, ".claude", "skills");
+    if (existsSync(skillDir)) {
+      skillCount = readdirSync(skillDir, { withFileTypes: true }).filter(d => d.isDirectory()).length;
+    }
+  } catch {}
+
   const today = new Date().toISOString().split("T")[0];
   const hasDiary = existsSync(join(WORKSPACE, "memory", `${today}.md`));
 
   return (
     `📋 Статус агента\n\n` +
-    `DNA-файлы: ${found.length}/4 (${found.join(", ")})\n` +
+    `DNA-файлы: ${found.length}/${dnaFiles.length} (${found.join(", ")})\n` +
     `${missing.length > 0 ? `Не найдены: ${missing.join(", ")}\n` : ""}` +
     `Дневник сегодня: ${hasDiary ? "есть" : "нет"}\n` +
     `Медиафайлов: ${mediaCount}\n` +
+    `Скиллов: ${skillCount}\n` +
     `Проекты: ${projectsList}\n\n` +
     `Workspace: ${WORKSPACE}\n` +
     `Проекты: ${PROJECTS}`
@@ -605,7 +891,7 @@ function getMemoryText() {
   let files = [];
   try {
     files = readdirSync(memoryDir)
-      .filter((f) => f.endsWith(".md"))
+      .filter((f) => f.endsWith(".md") && f !== "README.md")
       .sort()
       .reverse()
       .slice(0, 7);
@@ -628,38 +914,70 @@ function getMemoryText() {
   );
 }
 
+// ─── SEND RESPONSE ──────────────────────────────────────────────────────────
+
+const CHUNK_SOFT_LIMIT = 1800;
+const CHUNK_HARD_LIMIT = 4096;
+
+function sendChunked(html) {
+  const chunks = [];
+  const paragraphs = html.split("\n\n");
+  let current = "";
+
+  for (const para of paragraphs) {
+    if (para.length > CHUNK_HARD_LIMIT) {
+      // Split oversized paragraph by lines
+      if (current) { chunks.push(current); current = ""; }
+      const lines = para.split("\n");
+      for (const line of lines) {
+        if (current.length + line.length + 1 > CHUNK_HARD_LIMIT) {
+          if (current) chunks.push(current);
+          current = line.slice(0, CHUNK_HARD_LIMIT);
+        } else {
+          current = current ? current + "\n" + line : line;
+        }
+      }
+    } else if (current.length + para.length + 2 > CHUNK_SOFT_LIMIT && current) {
+      chunks.push(current);
+      current = para;
+    } else {
+      current = current ? current + "\n\n" + para : para;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 async function sendResponse(ctx, text) {
   // Extract media tags before formatting
   const { cleaned, media } = extractMediaTags(text);
   const html = mdToTgHtml(cleaned);
 
-  if (html.length <= 4096) {
+  // Check if response needs confirmation buttons
+  const hasConfirmation = needsConfirmation(cleaned);
+
+  if (html.length <= CHUNK_HARD_LIMIT) {
+    const replyOpts = {
+      parse_mode: "HTML",
+      reply_markup: hasConfirmation ? confirmKeyboard() : mainKeyboard,
+    };
     try {
-      await ctx.reply(html, { parse_mode: "HTML", reply_markup: mainKeyboard });
+      await ctx.reply(html, replyOpts);
     } catch {
       // Fallback: if HTML parsing fails, send as plain text
-      await ctx.reply(text, { reply_markup: mainKeyboard });
+      await ctx.reply(cleaned, { reply_markup: mainKeyboard });
     }
   } else {
-    // Split on double newlines to keep paragraphs intact
-    const parts = [];
-    let current = "";
-    for (const para of html.split("\n\n")) {
-      if (current.length + para.length + 2 > 4096) {
-        if (current) parts.push(current);
-        current = para;
-      } else {
-        current = current ? current + "\n\n" + para : para;
-      }
-    }
-    if (current) parts.push(current);
-
-    for (let i = 0; i < parts.length; i++) {
-      const markup = i === parts.length - 1 ? { reply_markup: mainKeyboard } : {};
+    const chunks = sendChunked(html);
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
+      const markup = isLast
+        ? { reply_markup: hasConfirmation ? confirmKeyboard() : mainKeyboard }
+        : {};
       try {
-        await ctx.reply(parts[i], { parse_mode: "HTML", ...markup });
+        await ctx.reply(chunks[i], { parse_mode: "HTML", ...markup });
       } catch {
-        await ctx.reply(parts[i].replace(/<[^>]+>/g, ""), markup);
+        await ctx.reply(chunks[i].replace(/<[^>]+>/g, ""), markup);
       }
     }
   }
@@ -737,6 +1055,42 @@ bot.hears("🧠 Память", async (ctx) => {
   await ctx.reply(getMemoryText(), { reply_markup: mainKeyboard });
 });
 
+// ─── CONFIRMATION CALLBACKS ─────────────────────────────────────────────────
+
+bot.callbackQuery("confirm_yes", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = String(ctx.from.id);
+  const sessionId = sessions.get(userId) || null;
+
+  const thinkingMsg = await ctx.reply(nextThinkingPhrase());
+  const typingInterval = setInterval(() => {
+    if (!isGloballyRateLimited()) {
+      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+    }
+  }, 4000);
+
+  try {
+    const result = await callClaude("✔ Продолжай выполнение.", sessionId);
+    if (result.sessionId) {
+      sessions.set(userId, result.sessionId);
+      saveSessions();
+    }
+    clearInterval(typingInterval);
+    await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
+    await sendResponse(ctx, result.text);
+  } catch (err) {
+    clearInterval(typingInterval);
+    await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
+    const friendly = humanizeError(err.message);
+    await ctx.reply(friendly || "Ошибка. Попробуй ещё раз.", { reply_markup: mainKeyboard });
+  }
+});
+
+bot.callbackQuery("confirm_no", async (ctx) => {
+  await ctx.answerCallbackQuery("Остановлено");
+  await ctx.reply("Остановлено. Что делаем дальше?", { reply_markup: mainKeyboard });
+});
+
 // Handle photos (single or media group)
 bot.on("message:photo", async (ctx) => {
   const photo = ctx.message.photo[ctx.message.photo.length - 1]; // largest size
@@ -779,14 +1133,28 @@ bot.on("message:text", async (ctx) => {
   const userId = String(ctx.from.id);
   const text = ctx.message.text;
 
-  const thinkingMsg = await ctx.reply("Думаю... ⏳");
+  const thinkingMsg = await ctx.reply(nextThinkingPhrase());
+  let phraseInterval;
   const typingInterval = setInterval(() => {
-    ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+    if (!isGloballyRateLimited()) {
+      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+    }
   }, 4000);
 
+  // Rotate thinking phrases every 3 seconds
+  phraseInterval = setInterval(() => {
+    if (!isGloballyRateLimited()) {
+      ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id, nextThinkingPhrase()).catch(() => {});
+    }
+  }, 3000);
+
   try {
+    // Pre-fetch URLs in message
+    const urlContext = await prefetchUrls(text);
+    const enrichedPrompt = urlContext ? text + urlContext : text;
+
     const sessionId = sessions.get(userId) || null;
-    const result = await callClaude(text, sessionId);
+    const result = await callClaude(enrichedPrompt, sessionId);
 
     if (result.sessionId) {
       sessions.set(userId, result.sessionId);
@@ -794,26 +1162,33 @@ bot.on("message:text", async (ctx) => {
     }
 
     clearInterval(typingInterval);
+    clearInterval(phraseInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     await sendResponse(ctx, result.text);
   } catch (err) {
     clearInterval(typingInterval);
+    clearInterval(phraseInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[error]", err.message);
-    await ctx.reply("Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
+
+    // Check for rate limit
+    const match = err.message.match(/retry.after.*?(\d+)/i);
+    if (match) setGlobalRateLimit(parseInt(match[1]));
+
+    const friendly = humanizeError(err.message);
+    await ctx.reply(friendly || "Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
   }
 });
 
 // Handle voice messages
 bot.on("message:voice", async (ctx) => {
   if (!isOwner(ctx)) return;
-  if (!process.env.DEEPGRAM_API_KEY) {
-    return ctx.reply("Голосовые пока не поддерживаются. Нужен DEEPGRAM_API_KEY в .env", { reply_markup: mainKeyboard });
-  }
 
   const thinkingMsg = await ctx.reply("Слушаю голосовое... 🎤");
   const typingInterval = setInterval(() => {
-    ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+    if (!isGloballyRateLimited()) {
+      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+    }
   }, 4000);
 
   try {
@@ -823,16 +1198,20 @@ bot.on("message:voice", async (ctx) => {
     await downloadTgFile(fileUrl, tmpPath);
 
     const transcript = await transcribeVoice(tmpPath);
-    unlinkSync(tmpPath);
+    try { unlinkSync(tmpPath); } catch {}
 
     if (!transcript) {
       clearInterval(typingInterval);
       await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
-      return ctx.reply("Не удалось распознать голосовое. Попробуй ещё раз.", { reply_markup: mainKeyboard });
+      return ctx.reply(
+        "Не удалось распознать голосовое. Нужен Deepgram API ключ или локальный Whisper.\n" +
+        "Попробуй текстом.",
+        { reply_markup: mainKeyboard }
+      );
     }
 
     await ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id,
-      `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\nДумаю... ⏳`);
+      `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\n${nextThinkingPhrase()}`);
 
     const userId = String(ctx.from.id);
     const sessionId = sessions.get(userId) || null;
@@ -850,13 +1229,19 @@ bot.on("message:voice", async (ctx) => {
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[voice-error]", err.message);
-    await ctx.reply("Ошибка обработки голосового. Попробуй текстом.", { reply_markup: mainKeyboard });
+    const friendly = humanizeError(err.message);
+    await ctx.reply(friendly || "Ошибка обработки голосового. Попробуй текстом.", { reply_markup: mainKeyboard });
   }
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 
-bot.catch((err) => console.error("[bot-error]", err.message));
+bot.catch((err) => {
+  console.error("[bot-error]", err.message);
+  // Detect rate limit from bot framework
+  const match = String(err.message).match(/retry.after.*?(\d+)/i);
+  if (match) setGlobalRateLimit(parseInt(match[1]));
+});
 
 bot.start({
   onStart: () => {
