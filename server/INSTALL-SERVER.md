@@ -172,9 +172,9 @@ echo '=== Node.js ===' && node -v && echo '=== Claude Code ===' && which claude 
 > - Ваши файлы Агента скопированы в /home/agent/workspace/
 > - Рабочая папка для проектов: /home/agent/projects/
 
-## Шаг 7. Установи Telegram-бота (если указаны токены)
+## Шаг 7. Установи Telegram-бота (если указан токен бота)
 
-**Если пользователь указал Telegram-бот токен и Anthropic API-ключ** — установи бота. Если токены не указаны — пропусти этот шаг и перейди к шагу 8.
+**Если пользователь указал Telegram-бот токен** — установи бота. Если токен не указан — пропусти этот шаг и перейди к шагу 8.
 
 **7.1. Скачай файлы бота из репозитория:**
 ```
@@ -190,23 +190,36 @@ cd /home/agent/.agent/bot && npm install --production 2>&1 | tail -5 && echo OK
 ```
 cat > /home/agent/.agent/.env << 'ENVEOF'
 BOT_TOKEN=ТОКЕН_БОТА
-ANTHROPIC_API_KEY=КЛЮЧ_ANTHROPIC
 AGENT_HOME=/home/agent
 ENVEOF
 ```
-Замени `ТОКЕН_БОТА` и `КЛЮЧ_ANTHROPIC` на значения из сообщения пользователя.
+Замени `ТОКЕН_БОТА` на значение из сообщения пользователя.
 
-Если пользователь также указал DEEPGRAM_API_KEY — добавь его в .env:
-```
-echo 'DEEPGRAM_API_KEY=КЛЮЧ_DEEPGRAM' >> /home/agent/.agent/.env
-```
+**7.4. Авторизуй Claude Code через подписку.**
 
-**7.4. Установи systemd-сервис:**
+Бот использует Claude Code CLI, который работает через вашу подписку Claude. Авторизация — интерактивная, требует действий от пользователя. Скажи ему:
+
+> Сейчас нужно авторизовать Claude на сервере. Это как войти в аккаунт — делается один раз.
+>
+> **Шаг 1.** Откройте консоль сервера (beget.com → VPS → ваш сервер → Консоль)
+> **Шаг 2.** Войдите как root
+> **Шаг 3.** Введите команду:
+> ```
+> sudo -u agent claude auth login
+> ```
+> **Шаг 4.** На экране появится ссылка и код. Откройте ссылку в браузере, введите код и нажмите «Authorize»
+> **Шаг 5.** Вернитесь в консоль — должно появиться сообщение об успешной авторизации
+>
+> Когда закончите, напишите мне «готово».
+
+Жди ответа пользователя. Когда скажет «готово» — продолжай.
+
+**7.5. Установи systemd-сервис:**
 ```
 curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/agent-bot.service -o /etc/systemd/system/agent-bot.service && systemctl daemon-reload && systemctl enable agent-bot && systemctl start agent-bot && echo OK
 ```
 
-**7.5. Поправь владельца и проверь:**
+**7.6. Поправь владельца и проверь:**
 ```
 chown -R agent:agent /home/agent/.agent && sleep 3 && systemctl status agent-bot --no-pager -l 2>&1 | head -15
 ```
@@ -214,7 +227,7 @@ chown -R agent:agent /home/agent/.agent && sleep 3 && systemctl status agent-bot
 Если бот запустился — скажи пользователю:
 
 > Telegram-бот запущен! Напишите своему боту в Telegram — он должен ответить.
-> Бот работает 24/7 на сервере.
+> Бот работает 24/7 на сервере. Он использует вашу подписку Claude — никаких API-ключей не нужно.
 
 Если ошибка — покажи лог (`journalctl -u agent-bot -n 20 --no-pager`) и предложи решение.
 

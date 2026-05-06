@@ -76,12 +76,14 @@ IP: 123.45.67.89
 IP: 123.45.67.89
 Пароль: ваш_пароль
 Telegram-бот: 7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-Anthropic API key: sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-**Где взять токены:**
-- **Telegram-бот** — создайте через @BotFather в Telegram (команда /newbot)
-- **Anthropic API key** — получите на console.anthropic.com
+**Где взять токен бота:**
+- Откройте Telegram, найдите @BotFather
+- Отправьте команду /newbot, следуйте инструкциям
+- Скопируйте токен (длинная строка с двоеточием)
+
+Бот работает через вашу подписку Claude — API-ключ не нужен. Во время установки Claude попросит авторизоваться через браузер (один раз).
 
 Замените `123.45.67.89` на IP вашего сервера и `ваш_пароль` на пароль от VPS.
 
