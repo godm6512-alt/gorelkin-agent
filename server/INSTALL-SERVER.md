@@ -198,7 +198,7 @@ echo '=== Node.js ===' && node -v && echo '=== Claude Code ===' && which claude 
 
 **7.1. Скачай файлы бота из репозитория:**
 ```
-curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/index.js -o /home/agent/.agent/bot/index.js && curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/package.json -o /home/agent/.agent/bot/package.json && echo OK
+curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/index.js -o /home/agent/.agent/bot/index.js && curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/secrets-menu.js -o /home/agent/.agent/bot/secrets-menu.js && curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/package.json -o /home/agent/.agent/bot/package.json && echo OK
 ```
 
 **7.2. Установи зависимости:**
