@@ -20,6 +20,7 @@ import { execSync } from "node:child_process";
 import https from "node:https";
 import http from "node:http";
 import { handlePendingInput, registerSecretsHandlers } from "./secrets-menu.js";
+import { hasAnyTranscriber, registerVoiceHelpers, voiceFallbackKeyboard, VOICE_FALLBACK_PROMPT } from "./voice-helper.js";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -997,6 +998,9 @@ bot.api.config.use(autoRetry());
 // Меню /settings → 🔑 Переменные окружения (модуль secrets-menu.js)
 registerSecretsHandlers(bot, isOwner, mainKeyboard);
 
+// Подсказка при первом голосовом без распознавалки (модуль voice-helper.js)
+registerVoiceHelpers(bot, isOwner);
+
 // /start
 bot.command("start", async (ctx) => {
   // Auto-lock: first user to /start becomes the owner
@@ -1213,9 +1217,18 @@ bot.on("message:voice", async (ctx) => {
     if (!transcript) {
       clearInterval(typingInterval);
       await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
+
+      // Если ни Deepgram, ни Whisper не подключены — показываем интерактивное меню.
+      // Иначе расшифровка просто провалилась один раз — обычная ошибка.
+      if (!hasAnyTranscriber()) {
+        return ctx.reply(VOICE_FALLBACK_PROMPT, {
+          parse_mode: "HTML",
+          reply_markup: voiceFallbackKeyboard(),
+        });
+      }
+
       return ctx.reply(
-        "Не удалось распознать голосовое. Нужен Deepgram API ключ или локальный Whisper.\n" +
-        "Попробуй текстом.",
+        "Не получилось распознать на этот раз. Попробуй ещё раз или отправь текстом.",
         { reply_markup: mainKeyboard }
       );
     }
