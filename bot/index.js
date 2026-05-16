@@ -1,11 +1,13 @@
 /**
- * Agent Bot — Telegram bot powered by Claude Code CLI
+ * Agent Bot v2.0 — Telegram bot powered by Claude Code CLI
  * Part of jarvis-architect: personal AI agent for course students
  *
  * Features: text + voice + photos + documents + media groups → Claude Code → response
  *           sessions, DNA files, persistent keyboard, folder structure awareness
  *           stream mode, crash recovery, circuit breaker, confirmation buttons,
- *           thinking phrases rotation, URL pre-fetch, human-friendly errors
+ *           thinking phrases rotation, URL pre-fetch, human-friendly errors,
+ *           state persistence, feature flags, semantic memory, scheduler,
+ *           model selection, bootstrap, auto-continue, text batching
  */
 
 import { Bot, Keyboard, InlineKeyboard, InputFile } from "grammy";
@@ -34,9 +36,15 @@ const SESSIONS_FILE = join(DATA_DIR, "sessions.json");
 const OWNER_FILE = join(DATA_DIR, "owner.json");
 const SYSTEM_PROMPT_PATH = join(WORKSPACE, "CLAUDE.md");
 const CRASH_CONTEXT_FILE = join(DATA_DIR, ".crash_context.md");
+const STATE_FILE = join(DATA_DIR, "state.json");
+const SCHEDULES_FILE = join(DATA_DIR, "schedules.json");
 const MAX_SESSION_SIZE = 2 * 1024 * 1024; // 2 MB — start fresh if session too large
 const MAX_SYSTEM_PROMPT_CHARS = 30000;
 const STREAM_THROTTLE_MS = 1500;
+const BOT_VERSION = (() => {
+  try { return readFileSync(join(import.meta.dirname, "VERSION"), "utf8").trim(); }
+  catch { return "2.0.0"; }
+})();
 
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is required");
@@ -46,6 +54,140 @@ if (!BOT_TOKEN) {
 // Ensure directories exist
 for (const dir of [DATA_DIR, join(WORKSPACE, "memory"), join(WORKSPACE, "knowledge"), PROJECTS, MEDIA_DIR]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+// ─── STATE PERSISTENCE ──────────────────────────────────────────────────────
+
+function loadState() {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return {
+      model: "sonnet",
+      timezone: "Europe/Moscow",
+      bootstrapDone: false,
+      dailySpendLimit: 50,
+      costHistory: {},
+      featureFlags: {},
+    };
+  }
+}
+
+function saveState(s) {
+  writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+}
+
+let state = loadState();
+
+function isFeatureEnabled(flag) {
+  return state.featureFlags?.[flag] === true;
+}
+
+// ─── SEMANTIC MEMORY (optional — dynamic import) ────────────────────────────
+
+let _semanticMemory = null;
+
+async function initSemanticMemory() {
+  try {
+    const { initDb, saveNow } = await import("./lib/db.js");
+    const { startWatcher, reindexAll } = await import("./lib/memory-indexer.js");
+    await initDb();
+    startWatcher();
+    reindexAll().catch((e) => console.warn("[semantic-memory] reindexAll error:", e.message));
+    _semanticMemory = { initDb, saveNow };
+    console.log("[semantic-memory] Initialized");
+  } catch (e) {
+    console.warn("[semantic-memory] Not available:", e.message);
+    _semanticMemory = null;
+  }
+}
+
+// ─── SCHEDULER ──────────────────────────────────────────────────────────────
+
+function loadSchedules() {
+  try {
+    return JSON.parse(readFileSync(SCHEDULES_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+let _schedulerTimer = null;
+
+function startScheduler() {
+  if (_schedulerTimer) return;
+  _schedulerTimer = setInterval(async () => {
+    const schedules = loadSchedules();
+    if (schedules.length === 0) return;
+
+    const now = new Date();
+    const tz = state.timezone || "Europe/Moscow";
+    const localStr = now.toLocaleString("en-US", { timeZone: tz });
+    const local = new Date(localStr);
+    const hour = local.getHours();
+    const minute = local.getMinutes();
+    const dow = local.getDay() === 0 ? 7 : local.getDay(); // 1=Mon..7=Sun
+
+    for (const sched of schedules) {
+      if (!sched.enabled) continue;
+
+      let shouldFire = false;
+
+      if (sched.type === "daily" && sched.hour === hour && (sched.minute || 0) === minute) {
+        shouldFire = true;
+      } else if (sched.type === "weekly" && sched.hour === hour && (sched.minute || 0) === minute && sched.weekdays?.includes(dow)) {
+        shouldFire = true;
+      } else if (sched.type === "once" && sched.at) {
+        const fireAt = new Date(sched.at);
+        if (now >= fireAt && now - fireAt < 90000) shouldFire = true; // within 90s window
+      }
+
+      if (!shouldFire) continue;
+
+      // Dedup: skip if already fired this minute
+      const fireKey = `${sched.id}_${hour}_${minute}`;
+      if (sched._lastFire === fireKey) continue;
+      sched._lastFire = fireKey;
+
+      console.log(`[scheduler] Firing: ${sched.name} (${sched.type})`);
+
+      try {
+        if (sched.payload === "reminder" && sched.text) {
+          if (_ownerId) {
+            await bot.api.sendMessage(_ownerId, sched.text);
+          }
+        } else if (sched.payload === "task" && sched.prompt) {
+          if (_ownerId) {
+            const result = await callClaude(sched.prompt, null);
+            await sendToOwner(result.text);
+          }
+        }
+      } catch (e) {
+        console.error(`[scheduler] Error in ${sched.name}:`, e.message);
+      }
+
+      // Delete once-type after firing
+      if (sched.deleteAfterRun) {
+        const all = loadSchedules();
+        const filtered = all.filter((s) => s.id !== sched.id);
+        writeFileSync(SCHEDULES_FILE, JSON.stringify(filtered, null, 2));
+      }
+    }
+  }, 60000); // check every minute
+  console.log("[scheduler] Started");
+}
+
+async function sendToOwner(text) {
+  if (!_ownerId) return;
+  const html = mdToTgHtml(text);
+  const chunks = sendChunked(html);
+  for (const chunk of chunks) {
+    try {
+      await bot.api.sendMessage(_ownerId, chunk, { parse_mode: "HTML" });
+    } catch {
+      await bot.api.sendMessage(_ownerId, chunk.replace(/<[^>]+>/g, ""));
+    }
+  }
 }
 
 // ─── OWNER CHECK (auto-lock to first user) ──────────────────────────────────
@@ -358,7 +500,7 @@ function _callClaudeInner(prompt, sessionId, { onText } = {}) {
       "-p", prompt,
       "--output-format", useStream ? "stream-json" : "json",
       "--max-turns", "15",
-      "--model", "sonnet",
+      "--model", getCurrentModel(),
       "--dangerously-skip-permissions",
     ];
 
@@ -990,6 +1132,260 @@ async function sendResponse(ctx, text) {
   }
 }
 
+// ─── BOOTSTRAP (6-question wizard on first /start) ─────────────────────────
+
+const bootstrapStep = new Map(); // userId -> step name
+const bootstrapData = new Map(); // userId -> { name, sphere, tasks, stack, style, mission }
+
+const BOOTSTRAP_STEPS = {
+  ask_name: {
+    question: "Как тебя зовут?",
+    field: "name",
+    next: "ask_sphere",
+  },
+  ask_sphere: {
+    question: "Чем занимаешься? (сфера, бизнес, профессия)",
+    field: "sphere",
+    next: "ask_tasks",
+  },
+  ask_tasks: {
+    question: "Какие задачи хочешь решать с помощью агента?",
+    field: "tasks",
+    next: "ask_stack",
+  },
+  ask_stack: {
+    question: "Какие инструменты/технологии используешь?",
+    field: "stack",
+    next: "ask_style",
+  },
+  ask_style: {
+    question: "Как предпочитаешь общаться? Кратко или подробно? Формально или неформально?",
+    field: "style",
+    next: "ask_mission",
+  },
+  ask_mission: {
+    question: "Опиши в 1-2 предложениях главную цель работы с агентом",
+    field: "mission",
+    next: "confirm",
+  },
+};
+
+async function handleBootstrap(ctx, text) {
+  const userId = String(ctx.from.id);
+  const step = bootstrapStep.get(userId);
+  if (!step) return false;
+
+  const stepConfig = BOOTSTRAP_STEPS[step];
+
+  if (stepConfig) {
+    const data = bootstrapData.get(userId) || {};
+    data[stepConfig.field] = text;
+    bootstrapData.set(userId, data);
+
+    if (stepConfig.next === "confirm") {
+      const summary = formatBootstrapSummary(data);
+      const kb = new InlineKeyboard()
+        .text("\u2714 \u0421\u043e\u0437\u0434\u0430\u044e \u0414\u041d\u041a", "bootstrap_confirm")
+        .text("\u2716 \u0417\u0430\u043d\u043e\u0432\u043e", "bootstrap_restart");
+      await ctx.reply(summary, { parse_mode: "HTML", reply_markup: kb });
+      bootstrapStep.set(userId, "confirm");
+    } else {
+      bootstrapStep.set(userId, stepConfig.next);
+      await ctx.reply(BOOTSTRAP_STEPS[stepConfig.next].question);
+    }
+    return true;
+  }
+
+  if (step === "confirm") {
+    await ctx.reply("Нажми кнопку выше: \u2714 или \u2716");
+    return true;
+  }
+  return false;
+}
+
+function formatBootstrapSummary(data) {
+  return (
+    `<b>Проверь данные:</b>\n\n` +
+    `<b>Имя:</b> ${data.name}\n` +
+    `<b>Сфера:</b> ${data.sphere}\n` +
+    `<b>Задачи:</b> ${data.tasks}\n` +
+    `<b>Инструменты:</b> ${data.stack}\n` +
+    `<b>Стиль общения:</b> ${data.style}\n` +
+    `<b>Миссия:</b> ${data.mission}\n\n` +
+    `Всё верно? Создаю ДНК?`
+  );
+}
+
+function writeDNAFiles(data) {
+  const today = new Date().toISOString().slice(0, 10);
+
+  // USER.md
+  writeFileSync(join(WORKSPACE, "USER.md"),
+`# Клиент
+
+Имя: ${data.name}
+Сфера: ${data.sphere}
+Задачи: ${data.tasks}
+Инструменты: ${data.stack}
+Стиль общения: ${data.style}
+
+# Роль
+${data.sphere}
+
+# Задачи для агента
+${data.tasks}
+
+# Технический стек
+${data.stack}
+`);
+
+  // MEMORY.md
+  writeFileSync(join(WORKSPACE, "MEMORY.md"),
+`# Клиент
+
+Имя: ${data.name}
+Сфера: ${data.sphere}
+Задачи: ${data.tasks}
+Инструменты: ${data.stack}
+Стиль: ${data.style}
+Миссия: ${data.mission}
+
+# Факты
+
+(заполняется по мере общения)
+
+# Предпочтения
+
+- Стиль общения: ${data.style}
+`);
+
+  // MISSION.md
+  writeFileSync(join(WORKSPACE, "MISSION.md"),
+`# Миссия
+
+${data.mission}
+
+# Контекст
+
+Владелец: ${data.name}
+Сфера: ${data.sphere}
+`);
+
+  // GOALS.md
+  writeFileSync(join(WORKSPACE, "GOALS.md"),
+`# Цели и задачи
+
+Последнее обновление: ${today}
+
+## Основные задачи
+${data.tasks}
+
+## Активные проекты
+
+(заполняется по мере работы)
+`);
+
+  // PROJECTS.md
+  writeFileSync(join(WORKSPACE, "PROJECTS.md"),
+`# Проекты
+
+Последнее обновление: ${today}
+
+## Активные
+
+(заполняется по мере работы)
+
+## Архив
+
+(завершённые проекты)
+`);
+
+  // PREFERENCES.md
+  writeFileSync(join(WORKSPACE, "PREFERENCES.md"),
+`# Предпочтения
+
+## Стиль общения
+${data.style}
+
+## Инструменты
+${data.stack}
+
+## Формат ответов
+(уточняется по мере работы)
+`);
+
+  // LEARNED.md
+  writeFileSync(join(WORKSPACE, "LEARNED.md"),
+`# Что я узнал
+
+(заполняется агентом по мере работы — паттерны, предпочтения, инсайты)
+`);
+
+  // SOUL.md — don't overwrite if exists (install.sh already created it)
+  if (!existsSync(join(WORKSPACE, "SOUL.md"))) {
+    writeFileSync(join(WORKSPACE, "SOUL.md"),
+`# Личность агента
+
+Я — персональный AI-агент ${data.name}.
+Моя миссия: ${data.mission}
+
+## Принципы
+- Честность важнее вежливости
+- Действие важнее описания
+- Конкретика важнее полноты
+`);
+  }
+}
+
+// ─── TEXT BATCHING (collect multiple messages before sending) ────────────────
+
+const TEXT_BATCH_DELAY_MS = 1500;
+const textBatch = new Map(); // userId -> { texts[], timer, ctx }
+
+function enqueueText(ctx, text) {
+  const userId = String(ctx.from.id);
+  let batch = textBatch.get(userId);
+
+  if (batch) {
+    batch.texts.push(text);
+    batch.ctx = ctx;
+    clearTimeout(batch.timer);
+    batch.timer = setTimeout(() => processTextBatch(userId), TEXT_BATCH_DELAY_MS);
+    return;
+  }
+
+  batch = {
+    texts: [text],
+    ctx,
+    timer: setTimeout(() => processTextBatch(userId), TEXT_BATCH_DELAY_MS),
+  };
+  textBatch.set(userId, batch);
+}
+
+async function processTextBatch(userId) {
+  const batch = textBatch.get(userId);
+  if (!batch) return;
+  textBatch.delete(userId);
+  clearTimeout(batch.timer);
+
+  const { ctx, texts } = batch;
+  const combined = texts.join("\n\n");
+
+  await handleTextMessage(ctx, combined);
+}
+
+// ─── MODEL SELECTION ────────────────────────────────────────────────────────
+
+const MODEL_MAP = {
+  sonnet: "sonnet",
+  opus: "opus",
+  haiku: "haiku",
+};
+
+function getCurrentModel() {
+  return state.model || "sonnet";
+}
+
 // ─── TELEGRAM BOT ────────────────────────────────────────────────────────────
 
 const bot = new Bot(BOT_TOKEN);
@@ -1001,29 +1397,91 @@ registerSecretsHandlers(bot, isOwner, mainKeyboard);
 // Подсказка при первом голосовом без распознавалки (модуль voice-helper.js)
 registerVoiceHelpers(bot, isOwner);
 
-// /start
+// /start — with bootstrap trigger
 bot.command("start", async (ctx) => {
   // Auto-lock: first user to /start becomes the owner
   if (!_ownerId) {
     saveOwner(ctx);
+  }
+  if (!isOwner(ctx)) return;
+
+  // If bootstrap not done — start the 6-question wizard
+  if (!state.bootstrapDone) {
+    bootstrapStep.set(String(ctx.from.id), "ask_name");
+    bootstrapData.set(String(ctx.from.id), {});
     await ctx.reply(
       "Привет! Я твой персональный AI-агент.\n\n" +
-      "Я привязался к твоему аккаунту и буду отвечать только тебе.\n\n" +
-      "Пиши мне текстом, отправляй голосовые, фото или файлы — я помогу с любыми задачами.\n\n" +
-      "Используй кнопки внизу или просто пиши.\n\n" +
-      "📌 /settings — подключить API-ключи (Deepgram, GitHub, Vercel и т.д.)",
+      "Давай настроим меня под тебя — это займёт 1 минуту (6 вопросов).\n\n" +
+      BOOTSTRAP_STEPS.ask_name.question,
       { reply_markup: mainKeyboard }
     );
     return;
   }
-  if (!isOwner(ctx)) return;
+
   await ctx.reply(
     "Привет! Я твой персональный AI-агент.\n\n" +
     "Пиши мне текстом, отправляй голосовые, фото или файлы — я помогу с любыми задачами.\n\n" +
     "Используй кнопки внизу или просто пиши.\n\n" +
-    "📌 /settings — подключить API-ключи (Deepgram, GitHub, Vercel и т.д.)",
+    "/settings — подключить API-ключи\n/model — выбрать модель\n/update — обновить бота",
     { reply_markup: mainKeyboard }
   );
+});
+
+// Bootstrap callbacks
+bot.callbackQuery("bootstrap_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = String(ctx.from.id);
+  const data = bootstrapData.get(userId);
+  if (!data) return;
+
+  try {
+    writeDNAFiles(data);
+    state.bootstrapDone = true;
+    saveState(state);
+    bootstrapStep.delete(userId);
+    bootstrapData.delete(userId);
+    await ctx.reply(
+      "ДНК создана! Все 8 файлов записаны.\n\n" +
+      "Теперь просто пиши мне — я знаю кто ты и чем могу помочь.\n\n" +
+      "/settings — подключить API-ключи\n/model — выбрать модель",
+      { reply_markup: mainKeyboard }
+    );
+  } catch (err) {
+    console.error("[bootstrap]", err.message);
+    await ctx.reply("Ошибка при создании ДНК: " + err.message.slice(0, 200), { reply_markup: mainKeyboard });
+  }
+});
+
+bot.callbackQuery("bootstrap_restart", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = String(ctx.from.id);
+  bootstrapStep.set(userId, "ask_name");
+  bootstrapData.set(userId, {});
+  await ctx.reply("Начинаем заново.\n\n" + BOOTSTRAP_STEPS.ask_name.question);
+});
+
+// /model — select Claude model
+bot.command("model", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const current = getCurrentModel();
+  const kb = new InlineKeyboard()
+    .text(current === "sonnet" ? "Sonnet \u2714" : "Sonnet", "model_sonnet")
+    .text(current === "opus" ? "Opus \u2714" : "Opus", "model_opus")
+    .text(current === "haiku" ? "Haiku \u2714" : "Haiku", "model_haiku");
+  await ctx.reply(`Текущая модель: <b>${current}</b>\n\nВыбери модель:`, {
+    parse_mode: "HTML",
+    reply_markup: kb,
+  });
+});
+
+bot.callbackQuery(/^model_/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const model = ctx.callbackQuery.data.replace("model_", "");
+  if (MODEL_MAP[model]) {
+    state.model = MODEL_MAP[model];
+    saveState(state);
+    await ctx.editMessageText(`Модель переключена на <b>${model}</b>`, { parse_mode: "HTML" });
+  }
 });
 
 // /reset
@@ -1217,8 +1675,18 @@ bot.on("message:text", async (ctx) => {
   // Если ждём ввод секрета — обработать и не передавать в Claude
   if (await handlePendingInput(ctx)) return;
 
-  const userId = String(ctx.from.id);
   const text = ctx.message.text;
+
+  // Bootstrap intercept — if wizard is active, handle answers
+  if (await handleBootstrap(ctx, text)) return;
+
+  // Text batching — collect rapid messages (1.5s window)
+  enqueueText(ctx, text);
+});
+
+// Core text handler (called from batch processor or directly)
+async function handleTextMessage(ctx, text) {
+  const userId = String(ctx.from.id);
 
   const thinkingMsg = await ctx.reply(nextThinkingPhrase());
   let phraseInterval;
@@ -1241,11 +1709,25 @@ bot.on("message:text", async (ctx) => {
     const enrichedPrompt = urlContext ? text + urlContext : text;
 
     const sessionId = sessions.get(userId) || null;
-    const result = await callClaude(enrichedPrompt, sessionId);
+    let result = await callClaude(enrichedPrompt, sessionId);
 
     if (result.sessionId) {
       sessions.set(userId, result.sessionId);
       saveSessions();
+    }
+
+    // Auto-continue: if response looks truncated, send continuation
+    let autoContinues = 0;
+    while (autoContinues < 3 && isResponseTruncated(result.text)) {
+      autoContinues++;
+      console.log(`[auto-continue] Attempt ${autoContinues} for session ${result.sessionId}`);
+      const contResult = await callClaude("Продолжай.", result.sessionId);
+      if (contResult.sessionId) {
+        sessions.set(userId, contResult.sessionId);
+        saveSessions();
+      }
+      result.text += "\n\n" + contResult.text;
+      result.sessionId = contResult.sessionId || result.sessionId;
     }
 
     clearInterval(typingInterval);
@@ -1265,7 +1747,21 @@ bot.on("message:text", async (ctx) => {
     const friendly = humanizeError(err.message);
     await ctx.reply(friendly || "Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
   }
-});
+}
+
+// Auto-continue detection: response looks cut off mid-sentence
+function isResponseTruncated(text) {
+  if (!text || text.length < 200) return false;
+  const trimmed = text.trimEnd();
+  // Ends mid-word, mid-code-block, or with ellipsis-like patterns
+  if (trimmed.match(/```[^`]*$/)) return true; // unclosed code block
+  const lastChar = trimmed[trimmed.length - 1];
+  // Normal endings
+  if (".!?)>\"':;".includes(lastChar)) return false;
+  // Ends with a letter/digit mid-sentence — likely truncated
+  if (/[\w\u0400-\u04FF]$/.test(trimmed)) return true;
+  return false;
+}
 
 // Handle voice messages
 bot.on("message:voice", async (ctx) => {
@@ -1346,10 +1842,17 @@ bot.start({
       { command: "reset", description: "Новая сессия" },
       { command: "status", description: "Статус системы" },
       { command: "settings", description: "Подключить API-ключи" },
+      { command: "model", description: "Выбрать модель Claude" },
       { command: "update", description: "Обновить бота" },
       { command: "version", description: "Текущая версия" },
     ]);
-    console.log(`Agent bot started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
+
+    // Initialize optional modules
+    await initSemanticMemory();
+    startScheduler();
+
+    console.log(`Agent bot v${BOT_VERSION} started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
+    console.log(`Model: ${getCurrentModel()}, Bootstrap: ${state.bootstrapDone ? "done" : "pending"}`);
     if (_ownerId) console.log(`Owner: ${_ownerId} (only owner can use bot)`);
     else console.log("No owner yet — first /start will auto-lock");
   },
