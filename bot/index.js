@@ -2625,6 +2625,28 @@ bot.start({
     await initSemanticMemory();
     startScheduler();
 
+    // Reauth notify: если только что прошёл reauth-flow — сообщить юзеру что готов.
+    // Маркер пишется в completeReauthFlow перед process.exit(0); systemd рестартит.
+    try {
+      if (existsSync(REAUTH_NOTIFY_FILE)) {
+        const data = JSON.parse(readFileSync(REAUTH_NOTIFY_FILE, "utf8"));
+        const age = Date.now() - (data.ts || 0);
+        if (age < 5 * 60 * 1000 && data.chatId) {
+          await bot.api.sendMessage(
+            data.chatId,
+            "✅ Готов к работе! Можешь писать обычным сообщением."
+          );
+          appendReauthLog(`notify sent to chat ${data.chatId} (age ${age}ms)`);
+        } else {
+          appendReauthLog(`notify-marker stale (age ${age}ms) — discarded`);
+        }
+        unlinkSync(REAUTH_NOTIFY_FILE);
+      }
+    } catch (e) {
+      console.warn("[reauth-notify] error:", e.message);
+      try { unlinkSync(REAUTH_NOTIFY_FILE); } catch {}
+    }
+
     console.log(`Agent bot v${BOT_VERSION} started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
     console.log(`Model: ${getCurrentModel()}, Bootstrap: ${state.bootstrapDone ? "done" : "pending"}`);
     if (_ownerId) console.log(`Owner: ${_ownerId} (only owner can use bot)`);
