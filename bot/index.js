@@ -2331,6 +2331,34 @@ bot.command("connect", async (ctx) => {
   })();
 });
 
+bot.callbackQuery(/^connect:cancel:(\d+)$/, async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery("⛔");
+  const chatId = parseInt(ctx.match[1]);
+  const entry = connectProcs.get(chatId);
+  if (entry) {
+    entry.cancelled = true;
+    try { entry.proc.kill(); } catch {}
+    connectProcs.delete(chatId);
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("🚫 Подключение отменено.");
+});
+
+bot.callbackQuery("connect:disconnect", async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery("⛔");
+  await ctx.answerCallbackQuery();
+  try {
+    writeFileSync(TUNNEL_STOP_FLAG, "");
+    state.tunnelReady = false;
+    state.tunnelConnectedAt = undefined;
+    saveState(state);
+    await new Promise((r) => setTimeout(r, 2000));
+    await ctx.editMessageText("⏹ VS Code туннель отключён.\n\nДля повторного подключения: /connect");
+  } catch (err) {
+    await ctx.editMessageText(`❌ Ошибка при отключении: ${err.message}`);
+  }
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => {
