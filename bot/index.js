@@ -2159,6 +2159,178 @@ function isTunnelServiceActive() {
   });
 }
 
+bot.command("connect", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const chatId = ctx.chat.id;
+  const tunnelName = vscodeTunnelName();
+
+  // === ПУТЬ A: уже подключён (по state) ===
+  if (state.tunnelReady) {
+    const active = await isTunnelServiceActive();
+    if (active) {
+      if (!existsSync(TUNNEL_TOKEN_FILE)) {
+        // Сервис жив, но GitHub-токен пропал — переподключаем
+        state.tunnelReady = false;
+        state.tunnelConnectedAt = undefined;
+        saveState(state);
+        await ctx.reply("🔄 Туннель работает, но авторизация слетела. Переподключаю...");
+        // fall through к OAuth
+      } else {
+        const since = state.tunnelConnectedAt ? `\nПодключён: ${formatTunnelTimeAgo(state.tunnelConnectedAt)}` : "";
+        const url = `https://vscode.dev/tunnel/${tunnelName}`;
+        const kb = new InlineKeyboard().text("⏹ Отключить", "connect:disconnect");
+        await ctx.reply(
+          `✔ <b>VS Code подключён</b>\n\n` +
+          `Имя туннеля: <code>${tunnelName}</code>${since}\n\n` +
+          `🔗 <a href="${url}">Открыть в браузере</a>\n\n` +
+          `Или в VS Code: Cmd+Shift+P → Remote-Tunnels: Connect to Tunnel → <code>${tunnelName}</code>`,
+          { parse_mode: "HTML", reply_markup: kb, link_preview_options: { is_disabled: true } }
+        );
+        return;
+      }
+    } else {
+      // state говорит ready, но сервис не активен → сбрасываем и переподключаем
+      state.tunnelReady = false;
+      state.tunnelConnectedAt = undefined;
+      saveState(state);
+      await ctx.reply(
+        "🔄 Туннель отключился — нужна повторная авторизация GitHub.\n" +
+        "Это нормально — токен действует ~24 часа.\n\nПереподключаю..."
+      );
+    }
+  }
+
+  // === ПУТЬ B: подключаемся через OAuth ===
+  // Отменяем предыдущий висящий процесс если был
+  const prev = connectProcs.get(chatId);
+  if (prev) {
+    prev.cancelled = true;
+    try { prev.proc.kill(); } catch {}
+    connectProcs.delete(chatId);
+  }
+
+  // Проверка что бинарь code установлен
+  if (!existsSync(CODE_BIN)) {
+    await ctx.reply(
+      "⚠️ VS Code CLI не установлен на сервере.\n\n" +
+      "Запусти на сервере под root:\n" +
+      "<code>bash ~/jarvis-architect/templates/vscode-tunnel/install-vscode-tunnel.sh agent-" +
+      (_ownerId ? createHash("md5").update(String(_ownerId)).digest("hex").slice(0, 8) : "xxxxxxxx") +
+      "</code>",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await ctx.reply("🔌 Запускаю VS Code подключение...");
+
+  // IIFE чтобы команда вернулась сразу, OAuth идёт в фоне
+  (async () => {
+    let stepMsgId;
+    try {
+      // Pre-cleanup: если сервис активен но токена нет — корректно остановить
+      try {
+        const wasActive = await isTunnelServiceActive();
+        if (wasActive && !existsSync(TUNNEL_TOKEN_FILE)) {
+          writeFileSync(TUNNEL_STOP_FLAG, "");
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            if (!(await isTunnelServiceActive())) break;
+          }
+        }
+        try { unlinkSync(TUNNEL_START_FLAG); } catch {}
+        try { unlinkSync(TUNNEL_LOCK_FILE); } catch {}
+      } catch {}
+
+      // === OAUTH: spawn code tunnel user login --provider github ===
+      const deviceCode = await new Promise((resolve, reject) => {
+        const proc = spawn(CODE_BIN, ["tunnel", "user", "login", "--provider", "github"], {
+          env: {
+            ...process.env,
+            HOME: AGENT_HOME,
+            VSCODE_CLI_DATA_DIR: TUNNEL_STATE_DIR,
+          },
+        });
+        let buf = "";
+        const onData = (chunk) => {
+          buf += chunk.toString();
+          const urlMatch = buf.match(/https:\/\/github\.com\/login\/device/);
+          const codeMatch = buf.match(/code[:\s]+([A-Z0-9]{4}-[A-Z0-9]{4})/i);
+          if (urlMatch && codeMatch) {
+            resolve({ url: "https://github.com/login/device", code: codeMatch[1], proc });
+          }
+        };
+        proc.stdout?.on("data", onData);
+        proc.stderr?.on("data", onData);
+        proc.on("error", reject);
+        setTimeout(() => reject(new Error("Timeout: device code не получен за 30 сек")), 30000);
+      });
+
+      const entry = { proc: deviceCode.proc, cancelled: false };
+      connectProcs.set(chatId, entry);
+
+      const kbCancel = new InlineKeyboard().text("🚫 Отменить", `connect:cancel:${chatId}`);
+      const stepMsg = await bot.api.sendMessage(
+        chatId,
+        `📱 <b>Шаг 1 из 2 — GitHub авторизация</b>\n\n` +
+        `1. Открой в браузере: <a href="${deviceCode.url}">${deviceCode.url}</a>\n` +
+        `2. Введи код: <code>${deviceCode.code}</code>\n\n` +
+        `⏳ Жду подтверждения (до 2 минут)...`,
+        { parse_mode: "HTML", reply_markup: kbCancel, link_preview_options: { is_disabled: true } }
+      );
+      stepMsgId = stepMsg.message_id;
+
+      // Ждём exit 0 = юзер успешно авторизовался
+      await new Promise((resolve, reject) => {
+        deviceCode.proc.on("close", (code) => {
+          if (entry.cancelled) reject(new Error("cancelled"));
+          else if (code === 0) resolve();
+          else reject(new Error(`code tunnel exited with code ${code}`));
+        });
+        setTimeout(() => {
+          try { deviceCode.proc.kill(); } catch {}
+          reject(new Error("Timeout: авторизация не выполнена за 2 минуты"));
+        }, 120000);
+      });
+
+      connectProcs.delete(chatId);
+      if (stepMsgId) try { await bot.api.deleteMessage(chatId, stepMsgId); } catch {}
+
+      // === ЗАПУСК сервиса через path-юнит ===
+      writeFileSync(TUNNEL_START_FLAG, "");
+      await new Promise((r) => setTimeout(r, 6000));
+
+      if (!(await isTunnelServiceActive())) {
+        throw new Error("agent-tunnel.service не запустился. Попробуй /connect ещё раз.");
+      }
+
+      // === УСПЕХ ===
+      const nowIso = new Date().toISOString();
+      state.tunnelReady = true;
+      state.tunnelConnectedAt = nowIso;
+      saveState(state);
+
+      const url = `https://vscode.dev/tunnel/${tunnelName}`;
+      const kbDisconnect = new InlineKeyboard().text("⏹ Отключить", "connect:disconnect");
+      await bot.api.sendMessage(
+        chatId,
+        `✔ <b>VS Code подключение готово!</b>\n\n` +
+        `Имя туннеля: <code>${tunnelName}</code>\n` +
+        `Подключён: ${formatTunnelTimeAgo(nowIso)}\n\n` +
+        `🔗 <a href="${url}">Открыть в браузере</a>\n\n` +
+        `Или в VS Code на компьютере:\n` +
+        `Cmd+Shift+P → "Remote-Tunnels: Connect to Tunnel" → <code>${tunnelName}</code>`,
+        { parse_mode: "HTML", reply_markup: kbDisconnect, link_preview_options: { is_disabled: true } }
+      );
+    } catch (err) {
+      connectProcs.delete(chatId);
+      if (err.message === "cancelled") return;
+      if (stepMsgId) try { await bot.api.deleteMessage(chatId, stepMsgId); } catch {}
+      await bot.api.sendMessage(chatId, `❌ Ошибка: ${err.message}\n\nПопробуй снова /connect`);
+    }
+  })();
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => {
