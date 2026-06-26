@@ -35,7 +35,9 @@ echo "Bot directory: $BOT_DIR"
 
 # GitHub raw base URL
 REPO="Ntmib/jarvis-architect"
-BRANCH="main"
+# BRANCH можно переопределить через env var: BRANCH=feature/foo bash update-bot.sh
+# Полезно для тестирования предрелизных версий на одном волонтёре.
+BRANCH="${BRANCH:-main}"
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/bot"
 
 # Files to download
