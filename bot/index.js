@@ -2611,7 +2611,7 @@ bot.catch((err) => {
 
 bot.start({
   onStart: async () => {
-    await bot.api.setMyCommands([
+    bot.api.setMyCommands([
       { command: "start", description: "Меню" },
       { command: "stop", description: "Остановить задачу" },
       { command: "reset", description: "Новая сессия" },
@@ -2619,7 +2619,9 @@ bot.start({
       { command: "status", description: "Статус системы" },
       { command: "connect", description: "🔌 VS Code через туннель" },
       { command: "reauth", description: "🔑 Переподключить Claude" },
-    ]);
+      { command: "update", description: "🔄 Обновить бота" },
+      { command: "version", description: "ℹ️ Версия" },
+    ]).catch((e) => console.warn("[commands] setMyCommands failed:", e.message));
 
     // Initialize optional modules
     await initSemanticMemory();
