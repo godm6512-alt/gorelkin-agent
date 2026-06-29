@@ -1,8 +1,18 @@
 # Возобновление работы — v2.1.0 (ждём апрува волонтёра)
 
-Дата фиксации: 2026-06-26
+Дата фиксации: 2026-06-26 (обновлено 2026-06-29: фикс порядка handler-ов)
 Ответственный: Дмитрий + Джарвис
-Статус: **ВСЁ ГОТОВО, ЖДЁМ ОТВЕТ ВОЛОНТЁРА**
+Статус: **ФИКС ПОРЯДКА HANDLER-ОВ ОТПРАВЛЕН, ЖДЁМ ПОВТОРНЫЙ ТЕСТ ВОЛОНТЁРА**
+
+## 2026-06-29: фикс порядка handler-ов (коммит 55a9278)
+
+Симптом у волонтёра после первого апдейта: `/connect` виден в меню, но при вызове бот отвечал «Unknown command: /connect. Did you mean /context?» (это ответ Claude CLI — текст пересылался в Claude как обычный промпт).
+
+Причина: `bot.command("connect")` и `bot.command("reauth")` были зарегистрированы ПОСЛЕ `bot.on("message:text")`. В Grammy первый match выигрывает — message:text ловил `/connect` первым и заворачивал в enqueueText без вызова next(). До bot.command управление не доходило. Это противоречит структуре agent-factory templates/bot/index.js где все команды строго ДО message:text.
+
+Фикс: блок ~450 строк (константы TUNNEL_*, Map connectProcs+reauthSessions, helpers vscodeTunnelName/startReauthFlow/completeReauthFlow и др., оба bot.command + 2 callbackQuery) перенесён ДО bot.on("message:text"). Diff: 153 insertions + 153 deletions — чистый перенос.
+
+Push: `feature/connect-and-reauth` обновлён в origin. Волонтёр запускает ту же команду повторно — update-bot.sh подтянет фикс.
 
 ## Что сделано
 
