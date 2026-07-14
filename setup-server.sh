@@ -16,7 +16,7 @@ step() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 # =====================
 # 1. Проверка
 # =====================
-step "1/6. Проверка системы"
+step "1/5. Проверка системы"
 [[ $EUID -eq 0 ]] || err "Запустите от root (вы уже root в консоли Beget)"
 [[ -f /etc/os-release ]] && source /etc/os-release
 MEM_MB=$(free -m | awk '/Mem:/ {print $2}')
@@ -32,7 +32,7 @@ sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
 # =====================
 # 2. Системные пакеты + Node.js
 # =====================
-step "2/6. Установка пакетов"
+step "2/5. Установка пакетов"
 
 # Убираем битые репозитории NodeSource если есть
 rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
@@ -51,7 +51,7 @@ log "Node.js $(node -v)"
 # =====================
 # 3. Claude Code CLI
 # =====================
-step "3/6. Claude Code"
+step "3/5. Claude Code"
 if ! command -v claude &>/dev/null; then
   npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
 fi
@@ -74,7 +74,7 @@ fi
 # =====================
 # 4. Пользователь + структура папок
 # =====================
-step "4/6. Рабочее окружение"
+step "4/5. Рабочее окружение"
 
 USERNAME="agent"
 HOME_DIR="/home/$USERNAME"
@@ -112,7 +112,7 @@ for SKILL in discovery-interview content-creator fullstack-developer frontend-de
 done
 log "Скиллы установлены (4 навыка)"
 
-# Симлинк для единой памяти (бот и VS Code читают один CLAUDE.md)
+# Симлинк для единой памяти
 ln -sf "$HOME_DIR/workspace/CLAUDE.md" "$HOME_DIR/CLAUDE.md"
 
 # Права
@@ -121,56 +121,13 @@ chown -h "$USERNAME:$USERNAME" "$HOME_DIR/CLAUDE.md"
 log "Папки готовы: workspace/ (файлы агента), projects/ (проекты)"
 
 # =====================
-# 5. VS Code Tunnel
+# 5. Готово
 # =====================
-step "5/6. VS Code Tunnel"
-if ! command -v code &>/dev/null; then
-  log "Скачиваю VS Code CLI..."
-  # Сначала пробуем GitHub (работает на Beget), потом официальный сайт
-  GH_URL="https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz"
-  VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64"
-  curl -fL "$GH_URL" -o /tmp/vscode.tar.gz 2>&1 || curl -fL "$VS_URL" -o /tmp/vscode.tar.gz 2>&1 || warn "Ошибка скачивания VS Code CLI"
-  if [ -f /tmp/vscode.tar.gz ] && [ "$(wc -c < /tmp/vscode.tar.gz)" -gt 1000 ]; then
-    tar -xzf /tmp/vscode.tar.gz -C /usr/local/bin/ 2>&1
-    rm -f /tmp/vscode.tar.gz
-  else
-    warn "Файл VS Code CLI не скачался. Проверьте интернет."
-    rm -f /tmp/vscode.tar.gz
-  fi
-fi
-
-if command -v code &>/dev/null; then
-  log "VS Code CLI установлен"
-  echo ""
-  echo -e "${CYAN}Сейчас нужно привязать сервер к вашему GitHub.${NC}"
-  echo -e "${CYAN}Появится ссылка и код — откройте ссылку в браузере и введите код.${NC}"
-  echo -e "${CYAN}После авторизации нажмите Ctrl+C чтобы продолжить.${NC}"
-  echo ""
-  code tunnel --accept-server-license-terms || true
-  # Устанавливаем как постоянный сервис
-  code tunnel service install --accept-server-license-terms 2>/dev/null || true
-  log "VS Code Tunnel установлен как постоянный сервис"
-else
-  warn "Не удалось установить VS Code CLI. Установите вручную:"
-  warn "curl -fL 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o /tmp/c.tar.gz && tar -xzf /tmp/c.tar.gz -C /usr/local/bin/"
-fi
-
-# =====================
-# 6. Готово
-# =====================
-step "6/6. Готово!"
+step "5/5. Готово!"
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║  Сервер готов для вашего AI-агента!          ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
-echo ""
-echo "Что дальше:"
-echo ""
-echo "1. Откройте VS Code на своём компьютере"
-echo "2. Слева найдите раздел «Удалённый обозреватель» (Remote Explorer)"
-echo "3. В разделе Tunnels появится ваш сервер — нажмите на него"
-echo "4. Перетащите мышкой ваши DNA-файлы (SOUL.md, CLAUDE.md и т.д.)"
-echo "   в папку /home/agent/workspace/"
 echo ""
 echo "Ваш агент будет жить в: /home/agent/workspace/"
 echo "Проекты агента будут в: /home/agent/projects/"

@@ -130,33 +130,7 @@ expect -c '
 run_remote "chown -R agent:agent /home/agent/workspace"
 ```
 
-### Шаг 5. Установи VS Code Tunnel
-
-```bash
-# Скачай VS Code CLI
-run_remote "
-  if ! command -v code >/dev/null 2>&1; then
-    curl -fL 'https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz' -o /tmp/vscode.tar.gz 2>&1 || curl -fL 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o /tmp/vscode.tar.gz 2>&1
-    tar -xzf /tmp/vscode.tar.gz -C /usr/local/bin/ 2>&1
-    rm -f /tmp/vscode.tar.gz
-  fi
-"
-```
-
-**Важно:** VS Code Tunnel требует интерактивной авторизации через GitHub. Скажи пользователю:
-
-> «Система на сервере установлена, ваши файлы скопированы. Остался последний шаг — привязать сервер к вашему VS Code.
->
-> Зайдите в панель Beget → VPS → Консоль (VNC) и введите:
-> code tunnel --accept-server-license-terms
->
-> Появится ссылка и код — откройте ссылку в браузере и введите код.
-> После авторизации нажмите Ctrl+C и введите:
-> code tunnel service install --accept-server-license-terms
->
-> Это сделает подключение постоянным. После этого откройте VS Code на компьютере → Remote Explorer → Tunnels → ваш сервер.»
-
-### Шаг 6. Покажи результат
+### Шаг 5. Покажи результат
 
 Подключись к серверу и проверь что всё на месте:
 ```bash
@@ -170,7 +144,7 @@ run_remote "echo '=== Node ===' && node -v && echo '=== Claude ===' && which cla
 > - Ваши файлы Агента в /home/agent/workspace/
 > - Папка для проектов /home/agent/projects/
 >
-> Осталось подключить VS Code Tunnel (инструкция выше) — и вы сможете работать с сервером как с обычной папкой на своём компьютере.»
+> Дальше я буду подключаться к серверу сам, когда понадобится что-то поправить — отдельно ничего настраивать не нужно.»
 
 ## Безопасность
 
@@ -183,7 +157,6 @@ run_remote "echo '=== Node ===' && node -v && echo '=== Claude ===' && which cla
 - **SSH не подключается** → VPN блокирует. Предложи VNC (2 команды)
 - **Node.js не ставится** → попробуй другую версию: setup_22.x
 - **Claude Code не ставится** → проверь npm: `run_remote "npm -v"`, если нет — переставь Node.js
-- **VS Code CLI не скачивается** → Beget блокирует code.visualstudio.com, используй GitHub Release: `https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz`
 - **expect не найден** → на Linux: `apt-get install -y expect`, на macOS — предустановлен
 
 ## Результат
@@ -191,5 +164,3 @@ run_remote "echo '=== Node ===' && node -v && echo '=== Claude ===' && which cla
 После выполнения всех шагов:
 - Сервер готов к работе
 - DNA-файлы на месте
-- VS Code Tunnel настроен (или инструкция выдана)
-- Пользователь может открыть VS Code → Remote Explorer → Tunnels → работать с сервером
