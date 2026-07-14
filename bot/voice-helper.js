@@ -2,9 +2,9 @@
  * Voice Helper — интерактивная подсказка при первом голосовом без распознавалки
  *
  * Когда ученик впервые шлёт голосовое и ни Deepgram, ни Whisper не подключены —
- * вместо сухого «Не удалось распознать» показываем меню с двумя кнопками:
+ * вместо сухого «Не удалось распознать» показываем меню с кнопками:
  *   ➕ Deepgram (рекомендуем) — ведёт в /settings пресет (5 минут, $200 кредитов)
- *   🔧 Установить Whisper       — короткая инструкция для VS Code Tunnel (бесплатно)
+ *   ➕ OpenAI Whisper — если уже есть ключ OpenAI
  *
  * Кнопка Deepgram использует существующий callback `env_quick_DEEPGRAM_API_KEY`
  * из secrets-menu.js — UX полностью переиспользуется (инструкция + удаление сообщения).
@@ -25,14 +25,14 @@ export function hasWhisperInstalled() {
 
 // Проверка — настроена ли хоть одна распознавалка
 export function hasAnyTranscriber() {
-  return !!process.env.DEEPGRAM_API_KEY || hasWhisperInstalled();
+  return !!process.env.DEEPGRAM_API_KEY || !!process.env.OPENAI_API_KEY || hasWhisperInstalled();
 }
 
-// Клавиатура с двумя кнопками для первого голосового без ключа
+// Клавиатура с кнопками для первого голосового без ключа
 export function voiceFallbackKeyboard() {
   return new InlineKeyboard()
-    .text("➕ Deepgram (рекомендуем)", "env_quick_DEEPGRAM_API_KEY").row()
-    .text("🔧 Установить Whisper", "voice_install_whisper");
+    .text("➕ Deepgram (лучшее качество)", "env_quick_DEEPGRAM_API_KEY").row()
+    .text("➕ OpenAI Whisper (если есть ключ)", "env_quick_OPENAI_API_KEY");
 }
 
 // Текст-приглашение к выбору
@@ -41,33 +41,9 @@ export const VOICE_FALLBACK_PROMPT =
   "Выбери один из вариантов:\n\n" +
   "<b>Deepgram</b> — облачное распознавание, точное и быстрое. " +
   "$200 кредитов без карты при регистрации (~770 часов на русском).\n\n" +
-  "<b>Whisper</b> — локальная установка на твой сервер. Бесплатно, " +
-  "но в 3-5 раз медленнее и требует ~8 минут на установку.";
-
-// Инструкция по установке Whisper через VS Code Tunnel
-const WHISPER_INSTRUCTIONS =
-  "🔧 <b>Установка Whisper</b> (~8 минут)\n\n" +
-  "1. Открой VS Code на ноуте → Remote Explorer → Tunnels → твой сервер\n" +
-  "2. В терминале сервера выполни одной строкой:\n\n" +
-  "<code>sudo apt install -y ffmpeg && sudo -H pip install --break-system-packages openai-whisper</code>\n\n" +
-  "3. Когда установка закончится — отправь мне голосовое снова. Подхвачу автоматически.\n\n" +
-  "<i>Если sudo нет — спроси у провайдера VPS пароль root либо подключи Deepgram (быстрее).</i>";
+  "<b>OpenAI Whisper</b> — если уже есть ключ OpenAI, голосовые заработают сразу.";
 
 export function registerVoiceHelpers(bot, isOwner) {
-  bot.callbackQuery("voice_install_whisper", async (ctx) => {
-    if (!isOwner(ctx)) return ctx.answerCallbackQuery();
-    await ctx.answerCallbackQuery();
-
-    try {
-      await ctx.editMessageText(WHISPER_INSTRUCTIONS, {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-      });
-    } catch {
-      await ctx.reply(WHISPER_INSTRUCTIONS, {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-      });
-    }
-  });
+  // Кнопки Deepgram/OpenAI обрабатываются через env_quick_* в secrets-menu.js —
+  // отдельных callback-хендлеров здесь не требуется.
 }
