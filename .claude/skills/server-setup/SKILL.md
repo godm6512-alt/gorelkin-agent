@@ -45,7 +45,7 @@ expect -c '
 **Если SSH не работает** (таймаут, connection refused, VPN блокирует):
 Скажи пользователю:
 > «Прямое подключение не проходит — скорее всего VPN блокирует. Есть простой запасной путь: зайдите в панель управления Beget → VPS → Консоль (VNC). Там введите две команды:
-> 1. wget ntmib.github.io/jarvis-architect/s
+> 1. wget https://raw.githubusercontent.com/godm6512-alt/gorelkin-agent/main/setup-server.sh -O s
 > 2. bash s
 > Скрипт всё установит. После этого скажите мне — я скопирую ваши файлы.»
 
@@ -136,7 +136,7 @@ run_remote "chown -R agent:agent /home/agent/workspace"
 # Скачай VS Code CLI
 run_remote "
   if ! command -v code >/dev/null 2>&1; then
-    curl -fL 'https://github.com/Ntmib/jarvis-architect/releases/download/v1.0.0/vscode-cli.tar.gz' -o /tmp/vscode.tar.gz 2>&1 || curl -fL 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o /tmp/vscode.tar.gz 2>&1
+    curl -fL 'https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz' -o /tmp/vscode.tar.gz 2>&1 || curl -fL 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o /tmp/vscode.tar.gz 2>&1
     tar -xzf /tmp/vscode.tar.gz -C /usr/local/bin/ 2>&1
     rm -f /tmp/vscode.tar.gz
   fi
@@ -183,7 +183,7 @@ run_remote "echo '=== Node ===' && node -v && echo '=== Claude ===' && which cla
 - **SSH не подключается** → VPN блокирует. Предложи VNC (2 команды)
 - **Node.js не ставится** → попробуй другую версию: setup_22.x
 - **Claude Code не ставится** → проверь npm: `run_remote "npm -v"`, если нет — переставь Node.js
-- **VS Code CLI не скачивается** → Beget блокирует code.visualstudio.com, используй GitHub Release: `https://github.com/Ntmib/jarvis-architect/releases/download/v1.0.0/vscode-cli.tar.gz`
+- **VS Code CLI не скачивается** → Beget блокирует code.visualstudio.com, используй GitHub Release: `https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz`
 - **expect не найден** → на Linux: `apt-get install -y expect`, на macOS — предустановлен
 
 ## Результат

@@ -139,15 +139,15 @@
 **Через окно Claude Code (рекомендуется):**
 
 ```
-Скачай папку .claude/skills из репозитория Ntmib/jarvis-architect
+Скачай папку .claude/skills из репозитория godm6512-alt/gorelkin-agent
 в мой проект jarvis. Адрес папки на GitHub:
-https://github.com/Ntmib/jarvis-architect/tree/main/.claude/skills
+https://github.com/godm6512-alt/gorelkin-agent/tree/main/.claude/skills
 ```
 
 **Или вручную через terminal** (для продвинутых):
 
 ```bash
-npx degit Ntmib/jarvis-architect/.claude/skills .claude/skills
+npx degit godm6512-alt/gorelkin-agent/.claude/skills .claude/skills
 ```
 
 После этого продолжите установку скиллов по фразам из этого файла.

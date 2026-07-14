@@ -3,7 +3,7 @@
 # Установка рабочего окружения для AI-агента на VPS
 # Курс «Архитектор нейросотрудников» — Урок 7
 #
-# Запуск: curl -sL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/setup-server.sh | bash
+# Запуск: curl -sL https://raw.githubusercontent.com/godm6512-alt/gorelkin-agent/main/setup-server.sh | bash
 # ============================================================
 set -euo pipefail
 
@@ -95,14 +95,14 @@ mkdir -p "$HOME_DIR/.claude/skills"
 
 # Дефолтные настройки Claude Code (светофор разрешений)
 if [ ! -f "$HOME_DIR/.claude/settings.json" ]; then
-  curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/.claude/settings.json \
+  curl -fsSL https://raw.githubusercontent.com/godm6512-alt/gorelkin-agent/main/.claude/settings.json \
     -o "$HOME_DIR/.claude/settings.json" 2>/dev/null \
     && log "Настройки Claude Code установлены" \
     || warn "Не удалось скачать settings.json — можно добавить позже"
 fi
 
 # Скиллы (навыки агента)
-SKILLS_BASE="https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/.claude/skills"
+SKILLS_BASE="https://raw.githubusercontent.com/godm6512-alt/gorelkin-agent/main/.claude/skills"
 for SKILL in discovery-interview content-creator fullstack-developer frontend-design; do
   if [ ! -f "$HOME_DIR/.claude/skills/$SKILL/SKILL.md" ]; then
     mkdir -p "$HOME_DIR/.claude/skills/$SKILL"
@@ -121,54 +121,38 @@ chown -h "$USERNAME:$USERNAME" "$HOME_DIR/CLAUDE.md"
 log "Папки готовы: workspace/ (файлы агента), projects/ (проекты)"
 
 # =====================
-# 5. VS Code Tunnel (через бот: /connect)
+# 5. VS Code Tunnel
 # =====================
-# Архитектура (v2.1.0): code CLI + 5 systemd-юнитов (agent-tunnel,
-# tunnel-ctl.*, tunnel-stop.*). Сервис НЕ стартует сразу — стартует когда
-# ученик в боте напишет /connect (бот создаст flag-файл ~/.agent/.tunnel-start,
-# path-юнит триггернёт start). 0 RAM-цены для тех кто не пользуется.
-#
-# Имя туннеля: agent-{md5(hostname).slice(0,8)} — привязано к серверу
-# (бот в /connect вычисляет так же — get'ит то же имя).
 step "5/6. VS Code Tunnel"
-
-TUNNEL_TEMPLATES_DIR="/tmp/jarvis-tunnel-templates"
-TUNNEL_BASE_URL="https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/templates/vscode-tunnel"
-TUNNEL_FILES=(
-  "install-vscode-tunnel.sh"
-  "agent-tunnel.service"
-  "tunnel-ctl.path"
-  "tunnel-ctl.service"
-  "tunnel-stop.path"
-  "tunnel-stop.service"
-)
-
-mkdir -p "$TUNNEL_TEMPLATES_DIR"
-TUNNEL_DOWNLOAD_OK=1
-for f in "${TUNNEL_FILES[@]}"; do
-  if ! curl -fsSL "$TUNNEL_BASE_URL/$f" -o "$TUNNEL_TEMPLATES_DIR/$f" 2>/dev/null; then
-    warn "Не удалось скачать templates/vscode-tunnel/$f"
-    TUNNEL_DOWNLOAD_OK=0
-    break
-  fi
-done
-
-if [[ $TUNNEL_DOWNLOAD_OK -eq 1 ]]; then
-  chmod +x "$TUNNEL_TEMPLATES_DIR/install-vscode-tunnel.sh"
-  # printf '%s' без newline — иначе md5(hostname + "\n") ≠ node os.hostname()
-  TUNNEL_HEX=$(printf '%s' "$(hostname)" | md5sum | cut -c1-8)
-  TUNNEL_NAME="agent-${TUNNEL_HEX}"
-  log "Имя туннеля: $TUNNEL_NAME (привязано к этому серверу)"
-
-  if bash "$TUNNEL_TEMPLATES_DIR/install-vscode-tunnel.sh" "$TUNNEL_NAME" "$TUNNEL_TEMPLATES_DIR" "$USERNAME"; then
-    log "VS Code Tunnel установлен. Запусти бота → /connect для авторизации GitHub"
+if ! command -v code &>/dev/null; then
+  log "Скачиваю VS Code CLI..."
+  # Сначала пробуем GitHub (работает на Beget), потом официальный сайт
+  GH_URL="https://github.com/godm6512-alt/gorelkin-agent/releases/download/v1.0.0/vscode-cli.tar.gz"
+  VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64"
+  curl -fL "$GH_URL" -o /tmp/vscode.tar.gz 2>&1 || curl -fL "$VS_URL" -o /tmp/vscode.tar.gz 2>&1 || warn "Ошибка скачивания VS Code CLI"
+  if [ -f /tmp/vscode.tar.gz ] && [ "$(wc -c < /tmp/vscode.tar.gz)" -gt 1000 ]; then
+    tar -xzf /tmp/vscode.tar.gz -C /usr/local/bin/ 2>&1
+    rm -f /tmp/vscode.tar.gz
   else
-    warn "Установка VS Code Tunnel провалилась (не критично — основной бот работает)"
-    warn "Можно установить позже вручную, или просто не пользоваться /connect"
+    warn "Файл VS Code CLI не скачался. Проверьте интернет."
+    rm -f /tmp/vscode.tar.gz
   fi
+fi
+
+if command -v code &>/dev/null; then
+  log "VS Code CLI установлен"
+  echo ""
+  echo -e "${CYAN}Сейчас нужно привязать сервер к вашему GitHub.${NC}"
+  echo -e "${CYAN}Появится ссылка и код — откройте ссылку в браузере и введите код.${NC}"
+  echo -e "${CYAN}После авторизации нажмите Ctrl+C чтобы продолжить.${NC}"
+  echo ""
+  code tunnel --accept-server-license-terms || true
+  # Устанавливаем как постоянный сервис
+  code tunnel service install --accept-server-license-terms 2>/dev/null || true
+  log "VS Code Tunnel установлен как постоянный сервис"
 else
-  warn "VS Code Tunnel пропущен — нет интернета или GitHub недоступен"
-  warn "Основной бот работает; /connect не заработает пока не установить туннель"
+  warn "Не удалось установить VS Code CLI. Установите вручную:"
+  warn "curl -fL 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o /tmp/c.tar.gz && tar -xzf /tmp/c.tar.gz -C /usr/local/bin/"
 fi
 
 # =====================

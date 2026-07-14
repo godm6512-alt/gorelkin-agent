@@ -8,9 +8,6 @@
  *
  * Кнопка Deepgram использует существующий callback `env_quick_DEEPGRAM_API_KEY`
  * из secrets-menu.js — UX полностью переиспользуется (инструкция + удаление сообщения).
- *
- * Адаптировано из Agent Factory templates/bot/index.js (упрощённая версия:
- * без auto-install Whisper — у некоторых учеников нет sudo).
  */
 
 import { InlineKeyboard } from "grammy";

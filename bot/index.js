@@ -1,6 +1,6 @@
 /**
  * Agent Bot v2.0 — Telegram bot powered by Claude Code CLI
- * Part of jarvis-architect: personal AI agent for course students
+ * gorelkin-agent: personal AI agent
  *
  * Features: text + voice + photos + documents + media groups → Claude Code → response
  *           sessions, DNA files, persistent keyboard, folder structure awareness
@@ -1851,69 +1851,6 @@ bot.command("status", async (ctx) => {
   await ctx.reply(status, { parse_mode: "HTML" });
 });
 
-// /update — self-update from GitHub
-bot.command("update", async (ctx) => {
-  if (!isOwner(ctx)) return;
-
-  const currentVer = (() => {
-    try { return readFileSync(join(import.meta.dirname, "VERSION"), "utf8").trim(); }
-    catch { return "unknown"; }
-  })();
-
-  await ctx.reply(`Проверяю обновления... (текущая версия: ${currentVer})`);
-
-  try {
-    // Check remote version
-    const remoteVer = await new Promise((resolve, reject) => {
-      https.get("https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/VERSION", {
-        timeout: 10000,
-        headers: { "User-Agent": "AgentBot" },
-      }, (res) => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-        let data = "";
-        res.on("data", (d) => data += d);
-        res.on("end", () => resolve(data.trim()));
-      }).on("error", reject);
-    });
-
-    if (remoteVer === currentVer) {
-      await ctx.reply(`У тебя последняя версия (${currentVer}).`);
-      return;
-    }
-
-    await ctx.reply(`Доступна версия ${remoteVer}. Обновляю...`);
-
-    // Run update-bot.sh
-    const botDir = import.meta.dirname;
-    const updateScript = join(botDir, "update-bot.sh");
-
-    // If update-bot.sh doesn't exist yet, download it first
-    if (!existsSync(updateScript)) {
-      execSync(
-        `curl -fsSL "https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/update-bot.sh" -o "${updateScript}" && chmod +x "${updateScript}"`,
-        { timeout: 15000 }
-      );
-    }
-
-    // Run the update script (it will restart the bot via systemd)
-    const result = execSync(`bash "${updateScript}" 2>&1`, {
-      timeout: 120000,
-      cwd: botDir,
-    }).toString();
-
-    // If we get here, the bot hasn't restarted yet (no systemd)
-    const lines = result.split("\n").filter(l => l.includes("===") || l.includes("ERROR") || l.includes("WARN"));
-    await ctx.reply(lines.join("\n") || "Обновление завершено. Бот перезапустится.");
-
-  } catch (err) {
-    console.error("[update]", err.message);
-    await ctx.reply(
-      `Ошибка обновления: ${err.message.slice(0, 200)}\n\nПопробуй вручную:\nbash update-bot.sh`,
-      {}
-    );
-  }
-});
-
 // /version
 bot.command("version", async (ctx) => {
   if (!isOwner(ctx)) return;
@@ -2296,7 +2233,7 @@ bot.command("connect", async (ctx) => {
       "⚠️ VS Code CLI не установлен на сервере.\n\n" +
       "Похоже что setup-server.sh пропустил установку туннеля (нет интернета или GitHub был недоступен).\n\n" +
       "Перезапусти установку:\n" +
-      "<code>curl -sL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/setup-server.sh | bash</code>",
+      "<code>curl -sL https://raw.githubusercontent.com/godm6512-alt/gorelkin-agent/main/setup-server.sh | bash</code>",
       { parse_mode: "HTML" }
     );
     return;

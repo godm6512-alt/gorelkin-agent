@@ -12,9 +12,6 @@
  *   - bot.api.deleteMessage для сообщений с секретами — не остаются в истории Telegram
  *   - Защита системных ключей (BOT_TOKEN, OWNER_ID, AGENT_HOME) от удаления через бот
  *   - Хранение в ~/.agent/.env (один файл, формат KEY=value)
- *
- * Адаптировано из Agent Factory templates/bot/index.js.
- * License: MIT (как и сам jarvis-architect).
  */
 
 import { InlineKeyboard } from "grammy";
